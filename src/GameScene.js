@@ -115,7 +115,7 @@ export default class GameScene extends Phaser.Scene {
         this.statusText.setText("Draw!");
       } else if (result === "disconnect") {
         this.statusText.setText("Opponent disconnected");
-      } else {
+      } else if (state.players) {
         const myPlayer = state.players.get(this.room.sessionId);
         if (myPlayer) {
           const myIndex = myPlayer.playerIndex;
@@ -172,6 +172,7 @@ export default class GameScene extends Phaser.Scene {
 
   drawPlayers(state) {
     this.playerGraphics.clear();
+    if (!state.players) return;
     state.players.forEach((player, sessionId) => {
       if (!player.alive) return;
       const isMe = sessionId === this.room.sessionId;
@@ -188,6 +189,7 @@ export default class GameScene extends Phaser.Scene {
 
   drawBombs(state) {
     this.bombGraphics.clear();
+    if (!state.bombs) return;
     state.bombs.forEach((bomb) => {
       this.bombGraphics.fillStyle(0x111111, 1);
       this.bombGraphics.fillCircle(
@@ -214,6 +216,7 @@ export default class GameScene extends Phaser.Scene {
   }
 
   updateDebug(state) {
+    if (!state.players) { this.debugText.setText("Syncing..."); return; }
     const myPlayer = state.players.get(this.room.sessionId);
     if (!myPlayer) {
       this.debugText.setText("Waiting...");
