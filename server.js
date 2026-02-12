@@ -182,6 +182,7 @@ class GameRoom extends Room {
     this.botBrains = {};
     this.moveDelay = 120;
     this.respawnQueue = [];
+    this.restartVotes = new Set();
 
     // Read room options
     const presetName = options.gridSize || "medium";
@@ -218,7 +219,15 @@ class GameRoom extends Room {
       this.handleWeaponFire(client);
     });
 
-    this.onMessage("restart", () => {});
+    this.onMessage("restart", (client) => {
+      this.restartVotes.add(client.sessionId);
+      const needed = this.state.players.size;
+      this.broadcast("restartVote", { current: this.restartVotes.size, needed });
+      if (this.restartVotes.size >= needed && needed > 0) {
+        this.restartVotes.clear();
+        this.startGame();
+      }
+    });
 
     console.log(`Room created: ${this.roomId} (code: ${options.roomCode || "none"}, grid: ${this.roomCols}x${this.roomRows}, bots: ${this.botCount} ${this.botDifficulty}, mode: ${this.gameMode})`);
   }
@@ -248,6 +257,7 @@ class GameRoom extends Room {
     console.log(`Player left: ${client.sessionId}`);
     this.state.players.delete(client.sessionId);
     delete this.playerLastMove[client.sessionId];
+    this.restartVotes.delete(client.sessionId);
 
     if (this.state.status === "playing") {
       this.state.status = "ended";
@@ -261,6 +271,9 @@ class GameRoom extends Room {
   }
 
   startGame() {
+    this.restartVotes = new Set();
+    this.broadcast("restartVote", { current: 0, needed: 0 });
+
     const cols = this.roomCols;
     const rows = this.roomRows;
 
@@ -272,13 +285,22 @@ class GameRoom extends Room {
     this.grid = grid;
     this.hiddenPowerups = hiddenPowerups;
 
-    // Flatten 2D grid to 1D ArraySchema
+    // Flatten 2D grid to 1D ArraySchema and count blocks
     this.state.map.clear();
+    this.blockCount = 0;
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
         this.state.map.push(this.grid[y][x]);
+        if (this.grid[y][x] === BLOCK) this.blockCount++;
       }
     }
+
+    // Late-game state
+    this.lateGameActive = false;
+    this.lateGameStartedAt = 0;
+    this.lastPowerupDrop = 0;
+    this.lastShrink = 0;
+    this.shrinkRing = 1;
 
     // Reset players to spawns
     const spawns = computeSpawns(cols, rows);
@@ -396,6 +418,9 @@ class GameRoom extends Room {
       return true;
     });
 
+    // Late-game events (powerup drops + shrinking border)
+    if (this.lateGameActive) this.tickLateGame(now);
+
     // Check win condition every tick (respawns change alive counts)
     this.checkWinCondition();
 
@@ -427,7 +452,10 @@ class GameRoom extends Room {
     }
 
     // Classic mode: permanent death
-    if (this.gameMode === "classic") return;
+    if (this.gameMode === "classic") {
+      entity.lives = 0;
+      return;
+    }
 
     // Decrement lives
     entity.lives--;
@@ -465,6 +493,11 @@ class GameRoom extends Room {
         this.grid[d.y][d.x] = EMPTY;
         this.state.map[d.y * cols + d.x] = EMPTY;
       }
+    }
+    this.blockCount -= destroyed.length;
+    if (this.blockCount <= 0 && !this.lateGameActive) {
+      this.lateGameActive = true;
+      this.lateGameStartedAt = Date.now();
     }
 
     // Kill entities in blast
@@ -568,6 +601,11 @@ class GameRoom extends Room {
         this.state.map[d.y * this.roomCols + d.x] = EMPTY;
       }
     }
+    this.blockCount -= destroyed.length;
+    if (this.blockCount <= 0 && !this.lateGameActive) {
+      this.lateGameActive = true;
+      this.lateGameStartedAt = Date.now();
+    }
 
     // Kill entities in affected tiles
     this.state.players.forEach((p, sid) => {
@@ -612,6 +650,115 @@ class GameRoom extends Room {
         this.state.bombs.delete(id);
         this.detonateBomb(chainBomb);
       }
+    }
+  }
+
+  tickLateGame(now) {
+    const cols = this.roomCols;
+    const rows = this.roomRows;
+
+    // Periodic powerup drops every 8 seconds
+    if (now - this.lastPowerupDrop >= 8000) {
+      this.lastPowerupDrop = now;
+
+      // Count existing powerups on map (cap at 5)
+      let powerupsOnMap = 0;
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+          if (this.grid[y][x] >= POWERUP_FLAMETHROWER) powerupsOnMap++;
+        }
+      }
+
+      if (powerupsOnMap < 5) {
+        // Collect empty tiles
+        const empties = [];
+        for (let y = 1; y < rows - 1; y++) {
+          for (let x = 1; x < cols - 1; x++) {
+            if (this.grid[y][x] === EMPTY) empties.push({ x, y });
+          }
+        }
+        if (empties.length > 0) {
+          const spot = empties[Math.floor(Math.random() * empties.length)];
+          const types = [POWERUP_FLAMETHROWER, POWERUP_RAYGUN, POWERUP_SHIELD];
+          const pType = types[Math.floor(Math.random() * types.length)];
+          this.grid[spot.y][spot.x] = pType;
+          this.state.map[spot.y * cols + spot.x] = pType;
+          this.broadcast("powerupDrop", { x: spot.x, y: spot.y });
+        }
+      }
+    }
+
+    // Shrinking border — starts 30s after late game begins
+    if (now - this.lateGameStartedAt >= 30000 && now - this.lastShrink >= 3000) {
+      const ring = this.shrinkRing;
+      // Stop if playable area would be less than 5x5
+      const playableW = cols - 2 * (ring + 1);
+      const playableH = rows - 2 * (ring + 1);
+      if (playableW < 5 || playableH < 5) return;
+
+      this.lastShrink = now;
+      const shrinkTiles = [];
+
+      // Top and bottom edges of this ring
+      for (let x = ring; x < cols - ring; x++) {
+        if (this.grid[ring][x] !== WALL) shrinkTiles.push({ x, y: ring });
+        if (this.grid[rows - 1 - ring][x] !== WALL) shrinkTiles.push({ x, y: rows - 1 - ring });
+      }
+      // Left and right edges (excluding corners already covered)
+      for (let y = ring + 1; y < rows - 1 - ring; y++) {
+        if (this.grid[y][ring] !== WALL) shrinkTiles.push({ x: ring, y });
+        if (this.grid[y][cols - 1 - ring] !== WALL) shrinkTiles.push({ x: cols - 1 - ring, y });
+      }
+
+      // Convert tiles to walls
+      for (const t of shrinkTiles) {
+        this.grid[t.y][t.x] = WALL;
+        this.state.map[t.y * cols + t.x] = WALL;
+      }
+
+      // Kill entities on shrunk tiles
+      this.state.players.forEach((player, sessionId) => {
+        if (!player.alive) return;
+        for (const t of shrinkTiles) {
+          if (t.x === player.x && t.y === player.y) {
+            this.killEntity(player, sessionId, false, null);
+            break;
+          }
+        }
+      });
+      this.state.npcs.forEach((npc, npcId) => {
+        if (!npc.alive) return;
+        for (const t of shrinkTiles) {
+          if (t.x === npc.x && t.y === npc.y) {
+            this.killEntity(npc, npcId, true, null);
+            break;
+          }
+        }
+      });
+
+      // Detonate bombs on shrunk tiles
+      const bombsToDetonate = [];
+      this.state.bombs.forEach((bomb, id) => {
+        for (const t of shrinkTiles) {
+          if (t.x === bomb.x && t.y === bomb.y) {
+            bombsToDetonate.push(id);
+            break;
+          }
+        }
+      });
+      for (const id of bombsToDetonate) {
+        const bomb = this.state.bombs.get(id);
+        if (bomb) {
+          const owner = this.state.players.get(bomb.ownerId)
+            || this.state.npcs.get(bomb.ownerId);
+          if (owner) owner.bombsAvailable++;
+          this.state.bombs.delete(id);
+          this.detonateBomb(bomb);
+        }
+      }
+
+      this.broadcast("shrink", { tiles: shrinkTiles });
+      this.shrinkRing++;
     }
   }
 

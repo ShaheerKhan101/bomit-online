@@ -54,6 +54,7 @@ export default class GameScene extends Phaser.Scene {
       right: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D),
     };
     this.spaceKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
+    this.rKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.R);
 
     this.moveDelay = 120;
     this.lastMoveTime = 0;
@@ -79,6 +80,9 @@ export default class GameScene extends Phaser.Scene {
 
     // Scoreboard text (top-right)
     this.scoreboardText = this.add.text(0, 4, "", { fontSize: "11px", fill: "#ffffff", align: "right" }).setDepth(10);
+
+    // Restart vote text
+    this.voteText = this.add.text(0, 0, "", { fontSize: "12px", fill: "#ffcc00", align: "center" }).setOrigin(0.5).setDepth(10);
 
     // Sound toggle icon
     this.soundToggle = this.add.text(0, 4, this.soundMgr.isEnabled() ? "SND" : "MUTE", {
@@ -132,6 +136,22 @@ export default class GameScene extends Phaser.Scene {
       this.soundMgr.playShieldAbsorb();
     });
 
+    this.room.onMessage("restartVote", (message) => {
+      if (message.current > 0 && message.needed > 0) {
+        this.voteText.setText(`Restart: ${message.current}/${message.needed} [R]`);
+      } else {
+        this.voteText.setText("");
+      }
+    });
+
+    this.room.onMessage("powerupDrop", () => {
+      this.soundMgr.playPowerupPickup();
+    });
+
+    this.room.onMessage("shrink", () => {
+      this.soundMgr.playExplosion();
+    });
+
     this.room.onError((code, message) => {
       console.error("Room error:", code, message);
       this.statusText.setText(`Error: ${message}`);
@@ -167,6 +187,7 @@ export default class GameScene extends Phaser.Scene {
     // Position text elements once we have dimensions
     if (!this.textPositioned && cols > 0 && rows > 0) {
       this.statusText.setPosition((cols * TILE) / 2, (rows * TILE) / 2);
+      this.voteText.setPosition((cols * TILE) / 2, (rows * TILE) / 2 + 24);
       this.debugText.setPosition(4, rows * TILE + 4);
       this.powerupText.setPosition(4, rows * TILE + 20);
       this.scoreboardText.setPosition(cols * TILE - 4, 4);
@@ -296,6 +317,10 @@ export default class GameScene extends Phaser.Scene {
         this.room.send("bomb", {});
         this.soundMgr.playBombPlace();
       }
+    }
+
+    if (Phaser.Input.Keyboard.JustDown(this.rKey)) {
+      this.room.send("restart", {});
     }
   }
 

@@ -165,6 +165,10 @@ function startPhaserGame(room, gridSize) {
     height: preset.rows * TILE + 40,
     backgroundColor: "#222222",
     parent: "gameContainer",
+    scale: {
+      mode: Phaser.Scale.FIT,
+      autoCenter: Phaser.Scale.CENTER_BOTH,
+    },
     scene: [],
   };
 
