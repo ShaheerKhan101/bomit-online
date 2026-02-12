@@ -24,7 +24,87 @@
       margin-bottom: 24px;
       color: #ff8844;
     }
-    #lobby input {
+
+    /* Initial screen — Host / Join buttons */
+    .lobby-choice {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .lobby-choice button {
+      padding: 14px 32px;
+      font-size: 18px;
+      border: 2px solid #ff8844;
+      border-radius: 8px;
+      background: #222;
+      color: #ff8844;
+      cursor: pointer;
+      font-weight: bold;
+      transition: background 0.2s, color 0.2s;
+    }
+    .lobby-choice button:hover {
+      background: #ff8844;
+      color: #111;
+    }
+
+    /* Host panel */
+    .host-panel, .join-panel {
+      display: none;
+    }
+    .lobby-options {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .lobby-options label {
+      font-size: 13px;
+      color: #aaa;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+    }
+    .lobby-options select {
+      padding: 8px 12px;
+      font-size: 14px;
+      border: 2px solid #555;
+      border-radius: 6px;
+      background: #222;
+      color: #fff;
+      outline: none;
+      cursor: pointer;
+    }
+    .lobby-options select:focus { border-color: #ff8844; }
+    .room-code-display {
+      margin: 16px 0;
+      font-size: 40px;
+      font-weight: bold;
+      color: #ff8844;
+      letter-spacing: 8px;
+      font-family: monospace;
+    }
+    .room-code-label {
+      font-size: 14px;
+      color: #aaa;
+      margin-bottom: 4px;
+    }
+    .copy-btn {
+      padding: 6px 16px;
+      font-size: 13px;
+      border: 1px solid #555;
+      border-radius: 4px;
+      background: #333;
+      color: #ccc;
+      cursor: pointer;
+      margin-top: 4px;
+    }
+    .copy-btn:hover { background: #444; color: #fff; }
+
+    /* Join panel */
+    .join-panel input {
       padding: 10px 16px;
       font-size: 18px;
       border: 2px solid #555;
@@ -35,9 +115,11 @@
       width: 200px;
       text-transform: uppercase;
     }
-    #lobby input:focus { border-color: #ff8844; }
-    #lobby button {
-      margin-left: 8px;
+    .join-panel input:focus { border-color: #ff8844; }
+    .join-panel .join-row {
+      margin-bottom: 12px;
+    }
+    .join-panel button, .host-panel .start-btn {
       padding: 10px 20px;
       font-size: 18px;
       border: none;
@@ -47,7 +129,19 @@
       cursor: pointer;
       font-weight: bold;
     }
-    #lobby button:hover { background: #ff6622; }
+    .join-panel button:hover, .host-panel .start-btn:hover { background: #ff6622; }
+    .back-btn {
+      padding: 8px 16px;
+      font-size: 14px;
+      border: 1px solid #555;
+      border-radius: 6px;
+      background: transparent;
+      color: #aaa;
+      cursor: pointer;
+      margin-top: 12px;
+    }
+    .back-btn:hover { color: #fff; border-color: #888; }
+
     #lobbyStatus {
       margin-top: 16px;
       font-size: 14px;
@@ -60,10 +154,84 @@
 <body>
   <div id="lobby">
     <h1>Bomb It Online</h1>
-    <div>
-      <input type="text" id="roomCode" placeholder="Room code" maxlength="10" autocomplete="off" />
-      <button id="joinBtn">Join</button>
+
+    <!-- Initial choice screen -->
+    <div id="choiceScreen" class="lobby-choice">
+      <button id="hostBtn">Host Game</button>
+      <button id="joinBtn">Join Game</button>
     </div>
+
+    <!-- Host panel -->
+    <div id="hostPanel" class="host-panel">
+      <div class="lobby-options">
+        <label>Grid Size
+          <select id="gridSize">
+            <option value="small">Small (11x9)</option>
+            <option value="medium" selected>Medium (13x11)</option>
+            <option value="large">Large (17x13)</option>
+            <option value="xl">XL (21x15)</option>
+          </select>
+        </label>
+        <label>Bots
+          <select id="botCount">
+            <option value="0">0</option>
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
+        </label>
+        <label>Bot Difficulty
+          <select id="botDifficulty">
+            <option value="easy">Easy</option>
+            <option value="medium" selected>Medium</option>
+            <option value="hard">Hard</option>
+          </select>
+        </label>
+      </div>
+      <div class="lobby-options">
+        <label>Game Mode
+          <select id="gameMode">
+            <option value="classic" selected>Classic</option>
+            <option value="lives">Lives</option>
+            <option value="kills">Kills</option>
+          </select>
+        </label>
+        <label id="livesLabel" style="display:none;">Starting Lives
+          <select id="startingLives">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3" selected>3</option>
+            <option value="5">5</option>
+          </select>
+        </label>
+        <label id="killsLabel" style="display:none;">Kill Target
+          <select id="killTarget">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="15">15</option>
+            <option value="20">20</option>
+          </select>
+        </label>
+      </div>
+      <div class="room-code-label">Share this code with your opponent:</div>
+      <div class="room-code-display" id="roomCodeDisplay">----</div>
+      <button class="copy-btn" id="copyCodeBtn">Copy Code</button>
+      <br/><br/>
+      <button class="start-btn" id="startHostBtn">Start Hosting</button>
+      <br/>
+      <button class="back-btn" id="hostBackBtn">Back</button>
+    </div>
+
+    <!-- Join panel -->
+    <div id="joinPanel" class="join-panel">
+      <div class="join-row">
+        <input type="text" id="roomCode" placeholder="Enter room code" maxlength="4" autocomplete="off" />
+        <button id="joinSubmitBtn">Join</button>
+      </div>
+      <button class="back-btn" id="joinBackBtn">Back</button>
+    </div>
+
     <p id="lobbyStatus"></p>
   </div>
   <div id="gameContainer"></div>

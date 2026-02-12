@@ -7,8 +7,9 @@ import express from "express";
 import { Server, Room } from "@colyseus/core";
 import { WebSocketTransport } from "@colyseus/ws-transport";
 import { Schema, defineTypes, MapSchema, ArraySchema } from "@colyseus/schema";
-import { COLS, ROWS, EMPTY, WALL, BLOCK, generateMap } from "./src/map.js";
-import { BOMB_FUSE, EXPLOSION_DURATION, DEFAULT_POWER, MAX_BOMBS, computeExplosion } from "./src/rules.js";
+import { EMPTY, WALL, BLOCK, GRID_PRESETS, POWERUP_FLAMETHROWER, POWERUP_RAYGUN, POWERUP_SHIELD, generateMap, computeSpawns } from "./src/map.js";
+import { BOMB_FUSE, EXPLOSION_DURATION, DEFAULT_POWER, MAX_BOMBS, computeExplosion, computeFlamethrowerExplosion, computeRaygunExplosion, computeFlamethrowerShot, computeRaygunShot } from "./src/rules.js";
+import { BotBrain } from "./src/bot.js";
 
 // --- Express app for static files ---
 
@@ -17,10 +18,8 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// Serve built client from /dist
 app.use(express.static(path.join(__dirname, "dist")));
 
-// SPA fallback — serve index.html for any non-API route
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "dist", "index.html"));
 });
@@ -36,6 +35,16 @@ class PlayerState extends Schema {
     this.bombsAvailable = MAX_BOMBS;
     this.power = DEFAULT_POWER;
     this.playerIndex = 0;
+    this.powerupType = 0;
+    this.powerupUses = 0;
+    this.hasShield = false;
+    this.facing = "down";
+    this.lives = 1;
+    this.kills = 0;
+    this.respawnAt = 0;
+    this.spawnX = 0;
+    this.spawnY = 0;
+    this.invincibleUntil = 0;
   }
 }
 defineTypes(PlayerState, {
@@ -45,6 +54,16 @@ defineTypes(PlayerState, {
   bombsAvailable: "uint8",
   power: "uint8",
   playerIndex: "uint8",
+  powerupType: "uint8",
+  powerupUses: "uint8",
+  hasShield: "boolean",
+  facing: "string",
+  lives: "uint8",
+  kills: "uint16",
+  respawnAt: "float64",
+  spawnX: "uint8",
+  spawnY: "uint8",
+  invincibleUntil: "float64",
 });
 
 class BombState extends Schema {
@@ -63,29 +82,91 @@ defineTypes(BombState, {
   explodeAt: "float64",
 });
 
+class NPCState extends Schema {
+  constructor() {
+    super();
+    this.x = 0;
+    this.y = 0;
+    this.alive = true;
+    this.bombsAvailable = MAX_BOMBS;
+    this.power = DEFAULT_POWER;
+    this.difficulty = "medium";
+    this.npcIndex = 0;
+    this.powerupType = 0;
+    this.powerupUses = 0;
+    this.hasShield = false;
+    this.facing = "down";
+    this.lives = 1;
+    this.kills = 0;
+    this.respawnAt = 0;
+    this.spawnX = 0;
+    this.spawnY = 0;
+    this.invincibleUntil = 0;
+  }
+}
+defineTypes(NPCState, {
+  x: "uint8",
+  y: "uint8",
+  alive: "boolean",
+  bombsAvailable: "uint8",
+  power: "uint8",
+  difficulty: "string",
+  npcIndex: "uint8",
+  powerupType: "uint8",
+  powerupUses: "uint8",
+  hasShield: "boolean",
+  facing: "string",
+  lives: "uint8",
+  kills: "uint16",
+  respawnAt: "float64",
+  spawnX: "uint8",
+  spawnY: "uint8",
+  invincibleUntil: "float64",
+});
+
 class GameState extends Schema {
   constructor() {
     super();
+    this.cols = 13;
+    this.rows = 11;
     this.map = new ArraySchema();
     this.players = new MapSchema();
     this.bombs = new MapSchema();
+    this.npcs = new MapSchema();
     this.status = "lobby";
     this.result = "";
+    this.gameMode = "classic";
+    this.startingLives = 1;
+    this.killTarget = 10;
   }
 }
 defineTypes(GameState, {
+  cols: "uint8",
+  rows: "uint8",
   map: ["uint8"],
   players: { map: PlayerState },
   bombs: { map: BombState },
+  npcs: { map: NPCState },
   status: "string",
   result: "string",
+  gameMode: "string",
+  startingLives: "uint8",
+  killTarget: "uint16",
 });
 
-// --- Spawn positions ---
-const SPAWNS = [
-  { x: 1, y: 1 },
-  { x: 11, y: 9 },
-];
+// --- Helpers ---
+
+function applyPowerup(entity, tileType) {
+  if (tileType === POWERUP_FLAMETHROWER) {
+    entity.powerupType = 1;
+    entity.powerupUses = 3;
+  } else if (tileType === POWERUP_RAYGUN) {
+    entity.powerupType = 2;
+    entity.powerupUses = 3;
+  } else if (tileType === POWERUP_SHIELD) {
+    entity.hasShield = true;
+  }
+}
 
 // --- Game Room ---
 
@@ -94,14 +175,37 @@ class GameRoom extends Room {
     this.setState(new GameState());
     this.maxClients = 2;
     this.grid = null;
+    this.hiddenPowerups = null;
     this.bombIdCounter = 0;
     this.playerLastMove = {};
-    this.moveDelay = 120; // ms between moves per player
+    this.npcLastMove = {};
+    this.botBrains = {};
+    this.moveDelay = 120;
+    this.respawnQueue = [];
 
-    // Start simulation loop (always runs, checks status inside)
+    // Read room options
+    const presetName = options.gridSize || "medium";
+    const preset = GRID_PRESETS[presetName] || GRID_PRESETS.medium;
+    this.roomCols = preset.cols;
+    this.roomRows = preset.rows;
+    this.botCount = Math.min(Math.max(parseInt(options.botCount) || 1, 0), 4);
+    this.botDifficulty = ["easy", "medium", "hard"].includes(options.botDifficulty)
+      ? options.botDifficulty : "medium";
+
+    // Game mode options
+    this.gameMode = ["classic", "lives", "kills"].includes(options.gameMode)
+      ? options.gameMode : "classic";
+    this.startingLives = [1, 2, 3, 5].includes(parseInt(options.startingLives))
+      ? parseInt(options.startingLives) : (this.gameMode === "lives" ? 3 : 1);
+    this.killTarget = [5, 10, 15, 20].includes(parseInt(options.killTarget))
+      ? parseInt(options.killTarget) : 10;
+
+    this.state.gameMode = this.gameMode;
+    this.state.startingLives = this.startingLives;
+    this.state.killTarget = this.killTarget;
+
     this.setSimulationInterval((dt) => this.tick(dt), 60);
 
-    // Message handlers
     this.onMessage("move", (client, message) => {
       this.handleMove(client, message);
     });
@@ -110,16 +214,19 @@ class GameRoom extends Room {
       this.handleBomb(client);
     });
 
-    this.onMessage("restart", (client) => {
-      // handled by auto-restart timer
+    this.onMessage("fire", (client) => {
+      this.handleWeaponFire(client);
     });
 
-    console.log(`Room created: ${this.roomId} (code: ${options.roomCode || "none"})`);
+    this.onMessage("restart", () => {});
+
+    console.log(`Room created: ${this.roomId} (code: ${options.roomCode || "none"}, grid: ${this.roomCols}x${this.roomRows}, bots: ${this.botCount} ${this.botDifficulty}, mode: ${this.gameMode})`);
   }
 
   onJoin(client, options) {
     const playerIndex = this.state.players.size;
-    const spawn = SPAWNS[playerIndex];
+    const spawns = computeSpawns(this.roomCols, this.roomRows);
+    const spawn = spawns.players[playerIndex];
 
     const player = new PlayerState();
     player.x = spawn.x;
@@ -154,34 +261,85 @@ class GameRoom extends Room {
   }
 
   startGame() {
-    // Generate map server-side
-    this.grid = generateMap();
+    const cols = this.roomCols;
+    const rows = this.roomRows;
+
+    this.state.cols = cols;
+    this.state.rows = rows;
+
+    // Generate map
+    const { grid, hiddenPowerups } = generateMap(cols, rows);
+    this.grid = grid;
+    this.hiddenPowerups = hiddenPowerups;
 
     // Flatten 2D grid to 1D ArraySchema
     this.state.map.clear();
-    for (let y = 0; y < ROWS; y++) {
-      for (let x = 0; x < COLS; x++) {
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
         this.state.map.push(this.grid[y][x]);
       }
     }
 
     // Reset players to spawns
+    const spawns = computeSpawns(cols, rows);
     let idx = 0;
     this.state.players.forEach((player) => {
-      const spawn = SPAWNS[idx];
+      const spawn = spawns.players[idx];
       player.x = spawn.x;
       player.y = spawn.y;
       player.alive = true;
       player.bombsAvailable = MAX_BOMBS;
       player.power = DEFAULT_POWER;
       player.playerIndex = idx;
+      player.powerupType = 0;
+      player.powerupUses = 0;
+      player.hasShield = false;
+      player.facing = "down";
+      player.spawnX = spawn.x;
+      player.spawnY = spawn.y;
+      player.kills = 0;
+      player.invincibleUntil = 0;
+      player.respawnAt = 0;
+      // Lives: classic=1, lives=configured, kills=255 (effectively infinite)
+      player.lives = this.gameMode === "kills" ? 255
+        : this.gameMode === "lives" ? this.startingLives : 1;
       idx++;
     });
 
-    // Clear bombs
+    // Clear bombs and NPCs
     this.state.bombs.clear();
+    this.state.npcs.clear();
     this.bombIdCounter = 0;
     this.playerLastMove = {};
+    this.npcLastMove = {};
+    this.botBrains = {};
+    this.respawnQueue = [];
+
+    // Spawn NPCs
+    for (let i = 0; i < this.botCount; i++) {
+      const spawn = spawns.npcs[i];
+      const npcId = `npc_${i}`;
+
+      const npc = new NPCState();
+      npc.x = spawn.x;
+      npc.y = spawn.y;
+      npc.alive = true;
+      npc.bombsAvailable = MAX_BOMBS;
+      npc.power = DEFAULT_POWER;
+      npc.difficulty = this.botDifficulty;
+      npc.npcIndex = i;
+      npc.facing = "down";
+      npc.spawnX = spawn.x;
+      npc.spawnY = spawn.y;
+      npc.kills = 0;
+      npc.invincibleUntil = 0;
+      npc.respawnAt = 0;
+      npc.lives = this.gameMode === "kills" ? 255
+        : this.gameMode === "lives" ? this.startingLives : 1;
+
+      this.state.npcs.set(npcId, npc);
+      this.botBrains[npcId] = new BotBrain(npcId, this.botDifficulty, cols, rows);
+    }
 
     this.state.status = "playing";
     this.state.result = "";
@@ -204,10 +362,11 @@ class GameRoom extends Room {
 
     for (const id of toExplode) {
       const bomb = this.state.bombs.get(id);
+      if (!bomb) continue; // Already chain-detonated
       this.detonateBomb(bomb);
 
-      // Return bomb slot to owner
-      const owner = this.state.players.get(bomb.ownerId);
+      const owner = this.state.players.get(bomb.ownerId)
+        || this.state.npcs.get(bomb.ownerId);
       if (owner) {
         owner.bombsAvailable++;
       }
@@ -215,33 +374,121 @@ class GameRoom extends Room {
       this.state.bombs.delete(id);
     }
 
-    // Check win condition after all explosions
-    if (toExplode.length > 0) {
-      this.checkWinCondition();
+    // Process respawns
+    this.respawnQueue = this.respawnQueue.filter(entry => {
+      if (now >= entry.respawnAt) {
+        const entity = entry.isNpc
+          ? this.state.npcs.get(entry.entityId)
+          : this.state.players.get(entry.entityId);
+        if (entity && !entity.alive && entity.lives > 0) {
+          entity.alive = true;
+          entity.x = entity.spawnX;
+          entity.y = entity.spawnY;
+          entity.respawnAt = 0;
+          entity.hasShield = false;
+          entity.powerupType = 0;
+          entity.powerupUses = 0;
+          entity.bombsAvailable = MAX_BOMBS;
+          entity.invincibleUntil = now + 1500;
+        }
+        return false;
+      }
+      return true;
+    });
+
+    // Check win condition every tick (respawns change alive counts)
+    this.checkWinCondition();
+
+    this.updateBots(dt);
+  }
+
+  killEntity(entity, entityId, isNpc, killerId) {
+    const now = Date.now();
+
+    // Invincibility check
+    if (entity.invincibleUntil > now) return;
+
+    // Shield absorb
+    if (entity.hasShield) {
+      entity.hasShield = false;
+      this.broadcast("shieldAbsorb", { entityId });
+      return;
     }
+
+    entity.alive = false;
+
+    // Credit the kill
+    if (killerId && killerId !== entityId) {
+      const killer = this.state.players.get(killerId)
+        || this.state.npcs.get(killerId);
+      if (killer) {
+        killer.kills++;
+      }
+    }
+
+    // Classic mode: permanent death
+    if (this.gameMode === "classic") return;
+
+    // Decrement lives
+    entity.lives--;
+
+    if (entity.lives <= 0) return; // Permanently dead
+
+    // Schedule respawn
+    const delay = this.gameMode === "kills" ? 1500 : 2000;
+    entity.respawnAt = now + delay;
+    this.respawnQueue.push({
+      entityId,
+      respawnAt: entity.respawnAt,
+      isNpc,
+    });
   }
 
   detonateBomb(bomb) {
-    const { tiles, destroyed } = computeExplosion(this.grid, bomb.x, bomb.y, DEFAULT_POWER);
+    const cols = this.roomCols;
+    const rows = this.roomRows;
+    const owner = this.state.players.get(bomb.ownerId)
+      || this.state.npcs.get(bomb.ownerId);
 
-    // Destroy blocks in internal grid and synced state
+    // Bombs always use standard explosion (weapons handle their own patterns)
+    const power = owner ? owner.power : DEFAULT_POWER;
+    const { tiles, destroyed } = computeExplosion(this.grid, bomb.x, bomb.y, power, cols, rows);
+
+    // Destroy blocks — reveal hidden powerups
     for (const d of destroyed) {
-      this.grid[d.y][d.x] = EMPTY;
-      this.state.map[d.y * COLS + d.x] = EMPTY;
+      const hidden = this.hiddenPowerups[d.y][d.x];
+      if (hidden > 0) {
+        this.grid[d.y][d.x] = hidden;
+        this.state.map[d.y * cols + d.x] = hidden;
+        this.hiddenPowerups[d.y][d.x] = 0;
+      } else {
+        this.grid[d.y][d.x] = EMPTY;
+        this.state.map[d.y * cols + d.x] = EMPTY;
+      }
     }
 
-    // Check if any player is caught in blast
-    this.state.players.forEach((player) => {
+    // Kill entities in blast
+    this.state.players.forEach((player, sessionId) => {
       if (!player.alive) return;
       for (const t of tiles) {
         if (t.x === player.x && t.y === player.y) {
-          player.alive = false;
+          this.killEntity(player, sessionId, false, bomb.ownerId);
           break;
         }
       }
     });
 
-    // Chain explosions: check if any other bomb is in the blast
+    this.state.npcs.forEach((npc, npcId) => {
+      if (!npc.alive) return;
+      for (const t of tiles) {
+        if (t.x === npc.x && t.y === npc.y) {
+          this.killEntity(npc, npcId, true, bomb.ownerId);
+          break;
+        }
+      }
+    });
+
+    // Chain explosions
     const chainsToExplode = [];
     this.state.bombs.forEach((otherBomb, id) => {
       for (const t of tiles) {
@@ -252,15 +499,116 @@ class GameRoom extends Room {
       }
     });
 
-    // Broadcast explosion event for client visuals
     this.broadcast("explosion", { tiles });
 
-    // Detonate chained bombs
     for (const id of chainsToExplode) {
       const chainBomb = this.state.bombs.get(id);
       if (chainBomb) {
-        const owner = this.state.players.get(chainBomb.ownerId);
-        if (owner) owner.bombsAvailable++;
+        const chainOwner = this.state.players.get(chainBomb.ownerId)
+          || this.state.npcs.get(chainBomb.ownerId);
+        if (chainOwner) chainOwner.bombsAvailable++;
+        this.state.bombs.delete(id);
+        this.detonateBomb(chainBomb);
+      }
+    }
+  }
+
+  handleWeaponFire(client) {
+    if (this.state.status !== "playing") return;
+
+    const player = this.state.players.get(client.sessionId);
+    if (!player || !player.alive) return;
+    if (player.powerupType === 0 || player.powerupUses <= 0) return;
+
+    this.fireWeapon(player, client.sessionId, false);
+  }
+
+  handleNpcWeaponFire(npcId, npc) {
+    if (!npc.alive) return;
+    if (npc.powerupType === 0 || npc.powerupUses <= 0) return;
+
+    this.fireWeapon(npc, npcId, true);
+  }
+
+  fireWeapon(entity, entityId, isNpc) {
+    const cols = this.roomCols;
+    const rows = this.roomRows;
+    const dir = entity.facing;
+
+    let result;
+    let weaponType;
+    if (entity.powerupType === 1) {
+      result = computeFlamethrowerShot(this.grid, entity.x, entity.y, dir, cols, rows);
+      weaponType = "flamethrower";
+    } else if (entity.powerupType === 2) {
+      result = computeRaygunShot(this.grid, entity.x, entity.y, dir, cols, rows);
+      weaponType = "raygun";
+    } else {
+      return;
+    }
+
+    const { tiles, destroyed } = result;
+
+    // Decrement uses
+    entity.powerupUses--;
+    if (entity.powerupUses <= 0) {
+      entity.powerupType = 0;
+      entity.powerupUses = 0;
+    }
+
+    // Destroy blocks, reveal powerups
+    for (const d of destroyed) {
+      const hidden = this.hiddenPowerups[d.y][d.x];
+      if (hidden > 0) {
+        this.grid[d.y][d.x] = hidden;
+        this.state.map[d.y * this.roomCols + d.x] = hidden;
+        this.hiddenPowerups[d.y][d.x] = 0;
+      } else {
+        this.grid[d.y][d.x] = EMPTY;
+        this.state.map[d.y * this.roomCols + d.x] = EMPTY;
+      }
+    }
+
+    // Kill entities in affected tiles
+    this.state.players.forEach((p, sid) => {
+      if (!p.alive || sid === entityId) return;
+      for (const t of tiles) {
+        if (t.x === p.x && t.y === p.y) {
+          this.killEntity(p, sid, false, entityId);
+          break;
+        }
+      }
+    });
+
+    this.state.npcs.forEach((npc, nid) => {
+      if (!npc.alive || nid === entityId) return;
+      for (const t of tiles) {
+        if (t.x === npc.x && t.y === npc.y) {
+          this.killEntity(npc, nid, true, entityId);
+          break;
+        }
+      }
+    });
+
+    // Chain-detonate any bombs hit
+    const chainsToExplode = [];
+    this.state.bombs.forEach((bomb, id) => {
+      for (const t of tiles) {
+        if (t.x === bomb.x && t.y === bomb.y) {
+          chainsToExplode.push(id);
+          break;
+        }
+      }
+    });
+
+    this.broadcast("weaponFire", { tiles, weaponType, dir, originX: entity.x, originY: entity.y });
+
+    for (const id of chainsToExplode) {
+      const chainBomb = this.state.bombs.get(id);
+      if (chainBomb) {
+        const chainOwner = this.state.players.get(chainBomb.ownerId)
+          || this.state.npcs.get(chainBomb.ownerId);
+        if (chainOwner) chainOwner.bombsAvailable++;
         this.state.bombs.delete(id);
         this.detonateBomb(chainBomb);
       }
@@ -268,27 +616,66 @@ class GameRoom extends Room {
   }
 
   checkWinCondition() {
-    const players = [];
+    if (this.gameMode === "kills") {
+      return this.checkKillsWin();
+    }
+    return this.checkLastStandingWin();
+  }
+
+  checkLastStandingWin() {
+    const entities = [];
+
     this.state.players.forEach((player, sessionId) => {
-      players.push({ sessionId, player });
+      // Entity is "out" if dead with no lives remaining and not respawning
+      const isOut = !player.alive && player.lives <= 0;
+      entities.push({ id: sessionId, out: isOut, isNpc: false, playerIndex: player.playerIndex });
     });
 
-    if (players.length < 2) return;
+    this.state.npcs.forEach((npc, npcId) => {
+      const isOut = !npc.alive && npc.lives <= 0;
+      entities.push({ id: npcId, out: isOut, isNpc: true });
+    });
 
-    const alive = players.filter(p => p.player.alive);
+    if (entities.length < 2) return;
 
-    if (alive.length === 0) {
-      // Both dead = draw
-      this.state.status = "ended";
-      this.state.result = "draw";
-      this.scheduleRestart();
-    } else if (alive.length === 1) {
-      // One alive = winner
-      const winner = alive[0].player.playerIndex === 0 ? "p1" : "p2";
-      this.state.status = "ended";
-      this.state.result = winner;
-      this.scheduleRestart();
+    const remaining = entities.filter(e => !e.out);
+
+    if (remaining.length === 0) {
+      this.endGame("draw");
+    } else if (remaining.length === 1) {
+      const winner = remaining[0];
+      this.endGame(winner.isNpc ? "npc" : (winner.playerIndex === 0 ? "p1" : "p2"));
     }
+  }
+
+  checkKillsWin() {
+    let winner = null;
+
+    this.state.players.forEach((player, sessionId) => {
+      if (player.kills >= this.killTarget) {
+        if (!winner || player.kills > winner.kills) {
+          winner = { isNpc: false, playerIndex: player.playerIndex, kills: player.kills };
+        }
+      }
+    });
+
+    this.state.npcs.forEach((npc, npcId) => {
+      if (npc.kills >= this.killTarget) {
+        if (!winner || npc.kills > winner.kills) {
+          winner = { isNpc: true, id: npcId, kills: npc.kills };
+        }
+      }
+    });
+
+    if (winner) {
+      this.endGame(winner.isNpc ? "npc" : (winner.playerIndex === 0 ? "p1" : "p2"));
+    }
+  }
+
+  endGame(result) {
+    this.state.status = "ended";
+    this.state.result = result;
+    this.scheduleRestart();
   }
 
   scheduleRestart() {
@@ -308,7 +695,6 @@ class GameRoom extends Room {
     const player = this.state.players.get(client.sessionId);
     if (!player || !player.alive) return;
 
-    // Rate limit
     const now = Date.now();
     const lastMove = this.playerLastMove[client.sessionId] || 0;
     if (now - lastMove < this.moveDelay) return;
@@ -321,17 +707,16 @@ class GameRoom extends Room {
     else if (dir === "right") dx = 1;
     else return;
 
+    player.facing = dir;
+
     const nx = player.x + dx;
     const ny = player.y + dy;
 
-    // Bounds
-    if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) return;
+    if (nx < 0 || nx >= this.roomCols || ny < 0 || ny >= this.roomRows) return;
 
-    // Collision with walls/blocks
     const tile = this.grid[ny][nx];
     if (tile === WALL || tile === BLOCK) return;
 
-    // Collision with bombs
     let blocked = false;
     this.state.bombs.forEach((bomb) => {
       if (bomb.x === nx && bomb.y === ny) blocked = true;
@@ -341,6 +726,14 @@ class GameRoom extends Room {
     player.x = nx;
     player.y = ny;
     this.playerLastMove[client.sessionId] = now;
+
+    // Powerup pickup
+    const tileAtNew = this.grid[ny][nx];
+    if (tileAtNew >= 3 && tileAtNew <= 5) {
+      applyPowerup(player, tileAtNew);
+      this.grid[ny][nx] = EMPTY;
+      this.state.map[ny * this.roomCols + nx] = EMPTY;
+    }
   }
 
   handleBomb(client) {
@@ -350,7 +743,6 @@ class GameRoom extends Room {
     if (!player || !player.alive) return;
     if (player.bombsAvailable <= 0) return;
 
-    // Check if bomb already at this position
     let occupied = false;
     this.state.bombs.forEach((bomb) => {
       if (bomb.x === player.x && bomb.y === player.y) occupied = true;
@@ -367,6 +759,98 @@ class GameRoom extends Room {
     this.state.bombs.set(id, bomb);
     player.bombsAvailable--;
   }
+
+  updateBots(dt) {
+    if (this.state.status !== "playing") return;
+
+    const now = Date.now();
+
+    const alivePlayers = [];
+    this.state.players.forEach((player, sessionId) => {
+      if (player.alive) {
+        alivePlayers.push({ x: player.x, y: player.y, id: sessionId });
+      }
+    });
+
+    this.state.npcs.forEach((npc, npcId) => {
+      if (!npc.alive) return;
+
+      const brain = this.botBrains[npcId];
+      if (!brain) return;
+
+      const action = brain.update(dt, npc, this.grid, this.state.bombs, alivePlayers, now);
+      if (!action) return;
+
+      if (action.type === "move") {
+        this.handleNpcMove(npcId, npc, action.dir, now);
+      } else if (action.type === "bomb") {
+        this.handleNpcBomb(npcId, npc, now);
+      } else if (action.type === "fire") {
+        npc.facing = action.dir;
+        this.handleNpcWeaponFire(npcId, npc);
+      }
+    });
+  }
+
+  handleNpcMove(npcId, npc, dir, now) {
+    const lastMove = this.npcLastMove[npcId] || 0;
+    if (now - lastMove < this.moveDelay) return;
+
+    let dx = 0, dy = 0;
+    if (dir === "up") dy = -1;
+    else if (dir === "down") dy = 1;
+    else if (dir === "left") dx = -1;
+    else if (dir === "right") dx = 1;
+    else return;
+
+    npc.facing = dir;
+
+    const nx = npc.x + dx;
+    const ny = npc.y + dy;
+
+    if (nx < 0 || nx >= this.roomCols || ny < 0 || ny >= this.roomRows) return;
+
+    const tile = this.grid[ny][nx];
+    if (tile === WALL || tile === BLOCK) return;
+
+    let blocked = false;
+    this.state.bombs.forEach((bomb) => {
+      if (bomb.x === nx && bomb.y === ny) blocked = true;
+    });
+    if (blocked) return;
+
+    npc.x = nx;
+    npc.y = ny;
+    this.npcLastMove[npcId] = now;
+
+    // Powerup pickup
+    const tileAtNew = this.grid[ny][nx];
+    if (tileAtNew >= 3 && tileAtNew <= 5) {
+      applyPowerup(npc, tileAtNew);
+      this.grid[ny][nx] = EMPTY;
+      this.state.map[ny * this.roomCols + nx] = EMPTY;
+    }
+  }
+
+  handleNpcBomb(npcId, npc, now) {
+    if (npc.bombsAvailable <= 0) return;
+
+    let occupied = false;
+    this.state.bombs.forEach((bomb) => {
+      if (bomb.x === npc.x && bomb.y === npc.y) occupied = true;
+    });
+    if (occupied) return;
+
+    const bomb = new BombState();
+    bomb.x = npc.x;
+    bomb.y = npc.y;
+    bomb.ownerId = npcId;
+    bomb.explodeAt = Date.now() + BOMB_FUSE;
+
+    const id = `b${this.bombIdCounter++}`;
+    this.state.bombs.set(id, bomb);
+    npc.bombsAvailable--;
+  }
 }
 
 // --- Boot Server ---
@@ -381,5 +865,5 @@ const gameServer = new Server({
 gameServer.define("game", GameRoom).filterBy(["roomCode"]);
 
 gameServer.listen(port).then(() => {
-  console.log(`🎮 Bomb It server listening on http://localhost:${port}`);
+  console.log(`Bomb It server listening on http://localhost:${port}`);
 });
